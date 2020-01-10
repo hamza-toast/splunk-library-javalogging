@@ -18,24 +18,18 @@ package com.splunk.logging;
  * under the License.
  */
 
-import org.apache.http.HttpResponse;
-import org.apache.http.client.config.CookieSpecs;
-import org.apache.http.client.config.RequestConfig;
-import org.apache.http.client.methods.HttpPost;
-import org.apache.http.concurrent.FutureCallback;
-import org.apache.http.conn.ssl.SSLConnectionSocketFactory;
-import org.apache.http.conn.ssl.SSLContexts;
-import org.apache.http.conn.ssl.TrustStrategy;
-import org.apache.http.entity.StringEntity;
-import org.apache.http.impl.nio.client.CloseableHttpAsyncClient;
-import org.apache.http.impl.nio.client.HttpAsyncClients;
-import org.apache.http.util.EntityUtils;
-
 import org.json.simple.JSONObject;
 
+import javax.net.ssl.HostnameVerifier;
 import javax.net.ssl.SSLContext;
+import javax.net.ssl.SSLSession;
+import javax.net.ssl.TrustManager;
+import javax.net.ssl.X509TrustManager;
+
 import java.io.IOException;
 import java.io.Serializable;
+import java.security.KeyManagementException;
+import java.security.NoSuchAlgorithmException;
 import java.security.cert.X509Certificate;
 import java.util.Dictionary;
 import java.util.Timer;
@@ -45,7 +39,15 @@ import java.util.LinkedList;
 import java.util.Map;
 import java.util.Locale;
 
-
+import okhttp3.Call;
+import okhttp3.Callback;
+import okhttp3.Dispatcher;
+import okhttp3.Headers;
+import okhttp3.MediaType;
+import okhttp3.OkHttpClient;
+import okhttp3.Request;
+import okhttp3.RequestBody;
+import okhttp3.Response;
 
 /**
  * This is an internal helper class that sends logging events to Splunk http event collector.
@@ -94,7 +96,7 @@ public class HttpEventCollectorSender extends TimerTask implements HttpEventColl
     private Timer timer;
     private List<HttpEventCollectorEventInfo> eventsBatch = new LinkedList<HttpEventCollectorEventInfo>();
     private long eventsBatchSize = 0; // estimated total size of events batch
-    private CloseableHttpAsyncClient httpClient;
+    private OkHttpClient httpClient;
     private boolean disableCertificateValidation = false;
     private SendMode sendMode = SendMode.Sequential;
     private HttpEventCollectorMiddleware middleware = new HttpEventCollectorMiddleware();
@@ -117,7 +119,7 @@ public class HttpEventCollectorSender extends TimerTask implements HttpEventColl
             long delay, long maxEventsBatchCount, long maxEventsBatchSize,
             String sendModeStr,
             Dictionary<String, String> metadata) {
-        this.url = Url + HttpEventCollectorUriPath;
+        this.url = Url;
         this.token = token;
         this.channel = channel;
         this.type = type;
@@ -204,8 +206,6 @@ public class HttpEventCollectorSender extends TimerTask implements HttpEventColl
     public synchronized void flush(boolean close) {
         if (eventsBatch.size() > 0) {
             postEventsAsync(eventsBatch, close);
-        } else if (close) {
-            this.stopHttpClient();
         }
         // Clear the batch. A new list should be created because events are
         // sending asynchronously and "previous" instance of eventsBatch object
@@ -280,56 +280,67 @@ public class HttpEventCollectorSender extends TimerTask implements HttpEventColl
         return event.toString();
     }
 
-    private void startHttpClient() {
+    private synchronized void initHttpClient() {
         if (httpClient != null) {
-            // http client is already started
+            // http client is already initialized
             return;
         }
-        // limit max  number of async requests in sequential mode, 0 means "use
-        // default limit"
-        int maxConnTotal = sendMode == SendMode.Sequential ? 1 : 0;
-        if (! disableCertificateValidation) {
-            // create an http client that validates certificates
-            httpClient = HttpAsyncClients.custom()
-                    .setDefaultRequestConfig(RequestConfig.custom().setCookieSpec(CookieSpecs.STANDARD).build())
-                    .setMaxConnTotal(maxConnTotal)
-                    .build();
-        } else {
-            // create strategy that accepts all certificates
-            TrustStrategy acceptingTrustStrategy = new TrustStrategy() {
-                public boolean isTrusted(X509Certificate[] certificate,
-                                         String type) {
-                    return true;
+
+        OkHttpClient.Builder clientBuilder = new OkHttpClient.Builder();
+
+        // limit max  number of concurrent requests in sequential mode
+        if (sendMode == SendMode.Sequential) {
+            Dispatcher dispatcher = new Dispatcher();
+            dispatcher.setMaxRequests(1);
+            dispatcher.setMaxRequestsPerHost(1);
+
+            clientBuilder.dispatcher(dispatcher);
+        }
+
+        if (disableCertificateValidation) {
+            setAllowAllStrategy(clientBuilder);
+        }
+
+        httpClient = clientBuilder.build();
+    }
+
+    private OkHttpClient.Builder setAllowAllStrategy(OkHttpClient.Builder builder) {
+        final TrustManager[] trustAllCerts = new TrustManager[] {
+                new X509TrustManager() {
+                    @Override
+                    public void checkClientTrusted(X509Certificate[] chain, String authType) {
+                    }
+
+                    @Override
+                    public void checkServerTrusted(X509Certificate[] chain, String authType) {
+                    }
+
+                    @Override
+                    public java.security.cert.X509Certificate[] getAcceptedIssuers() {
+                        return new X509Certificate[]{};
+                    }
                 }
-            };
-            SSLContext sslContext = null;
-            try {
-                sslContext = SSLContexts.custom().loadTrustMaterial(
-                        null, acceptingTrustStrategy).build();
-                httpClient = HttpAsyncClients.custom()
-                        .setDefaultRequestConfig(RequestConfig.custom().setCookieSpec(CookieSpecs.STANDARD).build())
-                        .setMaxConnTotal(maxConnTotal)
-                        .setHostnameVerifier(SSLConnectionSocketFactory.ALLOW_ALL_HOSTNAME_VERIFIER)
-                        .setSSLContext(sslContext)
-                        .build();
-            } catch (Exception e) { }
-        }
-        httpClient.start();
-    }
+        };
 
-    // Currently we never close http client. This method is added for symmetry
-    // with startHttpClient.
-    private void stopHttpClient() throws SecurityException {
-        if (httpClient != null) {
-            try {
-                httpClient.close();
-            } catch (IOException e) { }
-            httpClient = null;
+        SSLContext trustAllSslContext;
+        try {
+            trustAllSslContext = SSLContext.getInstance("SSL");
+            trustAllSslContext.init(null, trustAllCerts, new java.security.SecureRandom());
+        } catch (NoSuchAlgorithmException e) {
+            throw new RuntimeException(e);
+        } catch (KeyManagementException e) {
+            throw new RuntimeException(e);
         }
-    }
 
-    private void postEventsAsync(final List<HttpEventCollectorEventInfo> events) {
-        postEventsAsync(events, false);
+        return builder
+                .sslSocketFactory(trustAllSslContext.getSocketFactory(), (X509TrustManager)trustAllCerts[0])
+                .hostnameVerifier(new HostnameVerifier() {
+                    @Override
+                    public boolean verify(String hostname, SSLSession session) {
+                        return true;
+                    }
+                });
+
     }
 
     private void postEventsAsync(final List<HttpEventCollectorEventInfo> events, final boolean close) {
@@ -343,9 +354,6 @@ public class HttpEventCollectorSender extends TimerTask implements HttpEventColl
                             events,
                             new HttpEventCollectorErrorHandler.ServerErrorException(reply));
                 }
-                if (close) {
-                    sender.stopHttpClient();
-                }
             }
 
             @Override
@@ -353,55 +361,56 @@ public class HttpEventCollectorSender extends TimerTask implements HttpEventColl
                 HttpEventCollectorErrorHandler.error(
                         eventsBatch,
                         new HttpEventCollectorErrorHandler.ServerErrorException(ex.getMessage()));
-                if (close) {
-                    sender.stopHttpClient();
-                }
             }
         });
     }
 
     public void postEvents(final List<HttpEventCollectorEventInfo> events,
                            final HttpEventCollectorMiddleware.IHttpSenderCallback callback) {
-        startHttpClient(); // make sure http client is started
-        final String encoding = "utf-8";
+
+        initHttpClient();
+
         // convert events list into a string
         StringBuilder eventsBatchString = new StringBuilder();
         for (HttpEventCollectorEventInfo eventInfo : events)
             eventsBatchString.append(serializeEventInfo(eventInfo));
-        // create http request
-        final HttpPost httpPost = new HttpPost(url);
-        httpPost.setHeader(
-                AuthorizationHeaderTag,
-                String.format(AuthorizationHeaderScheme, token));
+
+        Headers.Builder headers = new Headers.Builder()
+                .add(AuthorizationHeaderTag, String.format(AuthorizationHeaderScheme, token));
         if ("Raw".equalsIgnoreCase(type) && channel != null && !channel.trim().equals("")) {
-            httpPost.setHeader(SPLUNKREQUESTCHANNELTag, channel);
+            headers.add(SPLUNKREQUESTCHANNELTag, channel);
         }
-        StringEntity entity = new StringEntity(eventsBatchString.toString(), encoding);
-        entity.setContentType(HttpContentType);
-        httpPost.setEntity(entity);
-        httpClient.execute(httpPost, new FutureCallback<HttpResponse>() {
+
+        MediaType JSON = MediaType.get("application/json; charset=utf-8");
+        RequestBody body = RequestBody.create(JSON, eventsBatchString.toString());
+
+        Request httpPost = new Request.Builder()
+                .url(url)
+                .post(body)
+                .headers(headers.build())
+                .build();
+
+        httpClient.newCall(httpPost).enqueue(new Callback() {
             @Override
-            public void completed(HttpResponse response) {
+            public void onFailure(Call call, IOException e) {
+                callback.failed(e);
+            }
+
+            @Override
+            public void onResponse(Call call, Response response) {
                 String reply = "";
-                int httpStatusCode = response.getStatusLine().getStatusCode();
+                int httpStatusCode = response.code();
                 // read reply only in case of a server error
                 if (httpStatusCode != 200) {
                     try {
-                        reply = EntityUtils.toString(response.getEntity(), encoding);
+                        reply = response.body().string();
                     } catch (IOException e) {
                         reply = e.getMessage();
                     }
                 }
                 callback.completed(httpStatusCode, reply);
             }
-
-            @Override
-            public void failed(Exception ex) {
-                callback.failed(ex);
-            }
-
-            @Override
-            public void cancelled() {}
         });
     }
+
 }
