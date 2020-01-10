@@ -1,5 +1,9 @@
 # Splunk Logging for Java Changelog
 
+## Version 1.7.4
+
+* Replaced Apache HttpAsyncClient by OkHttpClient
+
 ## Version 1.7.3
 
 * Update Log4j dependency version to 2.10.0 [#114](https://github.com/splunk/splunk-library-javalogging/pull/114).
